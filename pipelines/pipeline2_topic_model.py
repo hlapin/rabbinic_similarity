@@ -4,7 +4,7 @@ Pipeline 2: Topic model trained on Dicta lemmas → hard negative mining.
 Steps:
   1. Vectorize passages using the `lex` column (Dicta lemmas):
        - CountVectorizer (raw counts) → LDA input
-       - TfidfVectorizer (log-normalized) → NMF, BERTopic, cosine similarity
+       - TfidfVectorizer (log-normalized) → NMF, cosine similarity
   2. Fit BERTopic (or LDA/NMF fallback) on the appropriate matrix
   3. Assign topic labels to all passages
   4. Mine hard negatives: cross-topic pairs
@@ -15,13 +15,19 @@ Why lemmas, not raw text:
   - Morphological normalization means אוֹנָאָה and אונאה are the same feature
   - Dicta lemmatization handles prefix stripping, so ובאונאה → אונאה
 
+BERTopic — multilingual sentence-transformer:
+  - Uses language="multilingual" (paraphrase-multilingual-MiniLM-L12-v2)
+  - Handles Hebrew/Aramaic natively; no workaround needed
+  - Downloads ~400MB model on first run
+  - vectorizer_model uses token_pattern=r"[^\s]+" for Hebrew c-TF-IDF step
+
 GPU acceleration (BERTopic only):
   - UMAP → cuML UMAP          (cuml package, requires CUDA)
   - HDBSCAN → cuML HDBSCAN    (cuml package, requires CUDA)
   - Falls back to CPU versions if CUDA / cuML unavailable
 
 Dependencies:
-  pip install bertopic scikit-learn umap-learn hdbscan
+  pip install bertopic scikit-learn umap-learn hdbscan sentence-transformers
   GPU extras (optional):
     pip install cudf-cu12 cuml-cu12 --extra-index-url https://pypi.nvidia.com
   (LDA/NMF path: scikit-learn only — no extra deps)
@@ -53,7 +59,6 @@ def _cuda_is_available() -> bool:
         return torch.cuda.is_available()
     except ImportError:
         pass
-    # Fallback: probe nvidia-smi
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
@@ -81,13 +86,14 @@ def _install_package(pip_spec: str) -> bool:
 
 def _ensure_cpu_bertopic_deps() -> bool:
     """
-    Ensure bertopic, umap-learn, hdbscan are importable.
+    Ensure bertopic, umap-learn, hdbscan, sentence-transformers are importable.
     Installs them if missing. Returns True if all available after check.
     """
     deps = {
-        "bertopic": "bertopic",
-        "umap":     "umap-learn",
-        "hdbscan":  "hdbscan",
+        "bertopic":              "bertopic",
+        "umap":                  "umap-learn",
+        "hdbscan":               "hdbscan",
+        "sentence_transformers": "sentence-transformers",
     }
     all_ok = True
     for import_name, pip_name in deps.items():
@@ -104,11 +110,6 @@ def _cuda_version() -> tuple[int, int] | None:
     Used to select the correct cuML wheel (cu11 vs cu12).
     """
     try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=5
-        )
-        # nvidia-smi CUDA version via nvcc is more reliable
         nvcc = subprocess.run(
             ["nvcc", "--version"],
             capture_output=True, text=True, timeout=5
@@ -118,7 +119,6 @@ def _cuda_version() -> tuple[int, int] | None:
             m = re.search(r"release (\d+)\.(\d+)", nvcc.stdout)
             if m:
                 return int(m.group(1)), int(m.group(2))
-        # Fallback: read from /usr/local/cuda/version.txt
         cuda_ver_file = Path("/usr/local/cuda/version.txt")
         if cuda_ver_file.exists():
             text = cuda_ver_file.read_text()
@@ -139,9 +139,6 @@ def _ensure_cuml() -> bool:
     Selects the correct wheel based on CUDA version:
       CUDA 11.x → cuml-cu11
       CUDA 12.x → cuml-cu12  (Colab T4/A100, Kaggle T4/P100 post-2024)
-
-    Uses the RAPIDS pip index rather than the full conda install,
-    which avoids the 2-5GB conda environment download.
     """
     if importlib.util.find_spec("cuml") is not None:
         return True
@@ -174,7 +171,6 @@ print("Detecting compute environment ...")
 CUDA_AVAILABLE = _cuda_is_available()
 print(f"  CUDA: {'✓ available' if CUDA_AVAILABLE else '✗ not found'}")
 
-# Check / install CPU BERTopic stack
 print("Checking BERTopic dependencies ...")
 BERTOPIC_AVAILABLE = _ensure_cpu_bertopic_deps()
 if BERTOPIC_AVAILABLE:
@@ -185,7 +181,6 @@ if BERTOPIC_AVAILABLE:
 else:
     print("  ✗ BERTopic unavailable — only LDA/NMF will work")
 
-# Check / install cuML if CUDA present
 CUML_AVAILABLE = False
 if CUDA_AVAILABLE and BERTOPIC_AVAILABLE:
     print("CUDA detected — checking cuML for GPU acceleration ...")
@@ -197,7 +192,7 @@ if CUDA_AVAILABLE and BERTOPIC_AVAILABLE:
     else:
         print("  ✗ cuML install failed — BERTopic will use CPU UMAP/HDBSCAN")
 
-print()  # blank line after environment report
+print()
 
 
 # ---------------------------------------------------------------------------
@@ -208,12 +203,31 @@ def _base_vocab_params(
     min_df: int = 3,
     max_df: float = 0.85,
     max_features: int = 15_000,
+    ngram_range: tuple[int, int] = (1, 1),
 ) -> dict:
-    """Shared vocabulary parameters for both vectorizers."""
+    """
+    Shared vocabulary parameters for both vectorizers.
+
+    Parameters
+    ----------
+    min_df       : ignore lemmas appearing in fewer than min_df passages.
+                   Lower (e.g. 2) retains rare legal terms; higher (e.g. 5)
+                   keeps only well-attested vocabulary.
+    max_df       : ignore lemmas appearing in more than this fraction of
+                   passages. Removes formulaic phrases common to all topics
+                   (e.g. אמר, כדי) that add noise rather than signal.
+    max_features : vocabulary size cap. 15,000 covers virtually all
+                   attested Talmudic lemmas; reduce for faster iteration.
+    ngram_range  : (1,1) = unigrams only; (1,2) = unigrams + bigrams.
+                   Bigrams capture collocations like שבת מלאכה or
+                   נזיקין ממון that are more topic-specific than either
+                   lemma alone. Note: bigrams increase matrix size ~10x.
+    """
     return dict(
         min_df=min_df,
         max_df=max_df,
         max_features=max_features,
+        ngram_range=ngram_range,
         analyzer="word",
         token_pattern=r"[^\s]+",  # any non-whitespace token (handles Hebrew)
     )
@@ -224,6 +238,7 @@ def build_count_matrix(
     min_df: int = 3,
     max_df: float = 0.85,
     max_features: int = 15_000,
+    ngram_range: tuple[int, int] = (1, 1),
 ) -> tuple:
     """
     Fit a raw term-count matrix on lemmatized texts.
@@ -234,12 +249,15 @@ def build_count_matrix(
 
     Returns (vectorizer, count_matrix, feature_names)
     """
-    vectorizer = CountVectorizer(**_base_vocab_params(min_df, max_df, max_features))
+    vectorizer = CountVectorizer(
+        **_base_vocab_params(min_df, max_df, max_features, ngram_range)
+    )
     matrix = vectorizer.fit_transform(passages_df["lex"])
     feature_names = vectorizer.get_feature_names_out()
 
     print(f"Count matrix:  {matrix.shape[0]} passages × "
-          f"{matrix.shape[1]} lemma features  (for LDA)")
+          f"{matrix.shape[1]} lemma features  "
+          f"(ngram={ngram_range}, min_df={min_df}, max_df={max_df})  [LDA]")
     return vectorizer, matrix, feature_names
 
 
@@ -248,13 +266,13 @@ def build_tfidf_matrix(
     min_df: int = 3,
     max_df: float = 0.85,
     max_features: int = 15_000,
+    ngram_range: tuple[int, int] = (1, 1),
 ) -> tuple:
     """
     Fit a TF-IDF matrix on lemmatized texts.
 
     Used for:
       - NMF  (non-negativity constraint is compatible with TF-IDF floats)
-      - BERTopic (feeds TF-IDF representations into UMAP)
       - Cosine similarity baseline (IDF downweighting + L2 norm needed for
         fair comparison across passages of different lengths)
 
@@ -264,14 +282,15 @@ def build_tfidf_matrix(
     Returns (vectorizer, tfidf_matrix, feature_names)
     """
     vectorizer = TfidfVectorizer(
-        **_base_vocab_params(min_df, max_df, max_features),
+        **_base_vocab_params(min_df, max_df, max_features, ngram_range),
         sublinear_tf=True,
     )
     matrix = vectorizer.fit_transform(passages_df["lex"])
     feature_names = vectorizer.get_feature_names_out()
 
     print(f"TF-IDF matrix: {matrix.shape[0]} passages × "
-          f"{matrix.shape[1]} lemma features  (for NMF, BERTopic, cosine sim)")
+          f"{matrix.shape[1]} lemma features  "
+          f"(ngram={ngram_range}, min_df={min_df}, max_df={max_df})  [NMF, cosine sim]")
     return vectorizer, matrix, feature_names
 
 
@@ -290,9 +309,6 @@ def fit_lda(
     LDA is a generative model with a multinomial likelihood over word counts.
     Passing TF-IDF floats violates this assumption — the model will run but
     optimizes the wrong objective. Always use CountVectorizer output here.
-
-    n_topics=20: reasonable starting point for Talmud's tractate structure.
-    Tune using evaluate_lda_range() before committing.
 
     Returns (model, topic_assignments, topic_distributions)
     """
@@ -319,6 +335,8 @@ def evaluate_lda_range(
     Fit LDA for multiple topic counts on a COUNT matrix, return perplexity.
     Use to choose n_topics before final fit.
     Lower perplexity = better fit, but watch for overfitting past ~30 topics.
+
+    n_range: e.g. range(10, 61, 5) to test 10, 15, 20 ... 60 topics.
     """
     results = []
     for n in n_range:
@@ -374,7 +392,7 @@ def fit_nmf(
 
 
 # ---------------------------------------------------------------------------
-# BERTopic — CPU or GPU depending on environment
+# BERTopic — multilingual sentence-transformer + CPU/GPU UMAP/HDBSCAN
 # ---------------------------------------------------------------------------
 
 def _build_umap(seed: int, use_gpu: bool):
@@ -392,7 +410,7 @@ def _build_umap(seed: int, use_gpu: bool):
         return GpuUMAP(
             n_neighbors=15,
             n_components=5,
-            metric="euclidean",   # cuML UMAP is faster with euclidean
+            metric="euclidean",
         )
     else:
         return CpuUMAP(
@@ -431,87 +449,97 @@ def _build_hdbscan(use_gpu: bool):
 
 def fit_bertopic(
     passages_df: pd.DataFrame,
-    n_topics: int = 20,
+    n_topics: int = 60,
+    min_df: int = 1,
     seed: int = 42,
     force_cpu: bool = False,
 ) -> tuple:
     """
-    BERTopic over lemmatized texts, using TF-IDF matrix as embeddings.
+    BERTopic over lemmatized texts using a multilingual sentence-transformer.
 
-    Why we pass embeddings explicitly:
-      BERTopic's default pipeline runs a sentence-transformer to produce
-      embeddings, then feeds them into UMAP. For Hebrew/Aramaic there is no
-      suitable sentence-transformer, so we skip that step entirely by
-      pre-computing a TF-IDF matrix and passing it directly as `embeddings`
-      to fit_transform(). BERTopic then goes straight to UMAP → HDBSCAN
-      → topic representation, bypassing the neural embedding step.
+    Why language="multilingual":
+      BERTopic defaults to language="english", which loads an English-only
+      sentence-transformer and uses an ASCII-only internal tokenizer. Hebrew
+      and Aramaic tokens are silently dropped, producing an empty vocabulary
+      and a ValueError during the c-TF-IDF topic representation step.
+      Setting language="multilingual" loads paraphrase-multilingual-MiniLM-L12-v2
+      (~400MB, downloaded once), which encodes Hebrew/Aramaic natively.
 
-      The internal CountVectorizer (vectorizer_model) is used only for the
-      final topic-word representation step (c-TF-IDF), not for embeddings.
-      It must use token_pattern=r"[^\s]+" to handle Hebrew/Aramaic tokens;
-      the default r"(?u)\b\w\w+\b" pattern matches only ASCII word characters
-      and produces an empty vocabulary on Hebrew text.
+    Why vectorizer_model uses token_pattern=r"[^\s]+":
+      BERTopic's c-TF-IDF step (topic-word representation) uses a separate
+      CountVectorizer internally. We override it with a Hebrew-compatible
+      token pattern. min_df=1 is used here (not the corpus-level min_df)
+      because c-TF-IDF operates on per-topic document groups which are
+      much smaller than the full corpus.
+
+    nr_topics:
+      BERTopic's HDBSCAN typically finds more topics than desired (135 on
+      this corpus). nr_topics merges them down to the target count using
+      cosine similarity of topic vectors. Default 60 reflects empirical
+      results on this corpus.
 
     GPU path (when CUDA + cuML available):
-      UMAP and HDBSCAN run on GPU via cuML — typically 5-20x faster than CPU
-      for corpora of this size.
-
-    CPU path (fallback):
-      Standard umap-learn + hdbscan; slower but identical results.
+      UMAP and HDBSCAN run on GPU via cuML — typically 5-20x faster than CPU.
 
     Parameters
     ----------
+    n_topics  : target number of topics after BERTopic reduction (nr_topics)
+    min_df    : min document frequency for the internal c-TF-IDF vectorizer.
+                Keep at 1 — topic document groups are small after reduction.
     force_cpu : set True to skip GPU even when available (for debugging)
     """
     if not BERTOPIC_AVAILABLE:
         raise ImportError(
             "BERTopic dependencies missing. Run:\n"
-            "  pip install bertopic umap-learn hdbscan"
+            "  pip install bertopic umap-learn hdbscan sentence-transformers"
         )
 
     use_gpu = CUML_AVAILABLE and not force_cpu
     device_label = "GPU (cuML)" if use_gpu else "CPU"
     print(f"BERTopic: using {device_label} for UMAP + HDBSCAN")
+    print(f"BERTopic: language=multilingual, nr_topics={n_topics}")
 
     umap_model    = _build_umap(seed, use_gpu)
     hdbscan_model = _build_hdbscan(use_gpu)
 
-    # This vectorizer is used only for c-TF-IDF topic-word representations,
-    # NOT for producing embeddings. token_pattern must handle Hebrew tokens.
+    # Override internal c-TF-IDF vectorizer with Hebrew-compatible token pattern.
+    # min_df=1 because this vectorizer runs on per-topic subsets, not the full corpus.
     vectorizer_model = CountVectorizer(
         token_pattern=r"[^\s]+",
-        min_df=2,         # lowered from 3: small corpus, avoid empty vocab
-        stop_words=None,  # Dicta lemmas already normalized; keep all
+        min_df=min_df,
+        stop_words=None,
     )
 
-    #problem here
     topic_model = BERTopic(
+        language="multilingual",          # loads paraphrase-multilingual-MiniLM-L12-v2
         umap_model=umap_model,
         hdbscan_model=hdbscan_model,
         vectorizer_model=vectorizer_model,
         nr_topics=n_topics,
-        language="multilingual"
-        calculate_probabilities=not use_gpu,  # cuML HDBSCAN: no soft probs
+        calculate_probabilities=not use_gpu,
         verbose=True,
     )
 
-    docs = passages_df["lex"].tolist()
+    # Train on lemmatized text (lex) for topic quality.
+    # str_docs (original text) is returned so callers can pass it to
+    # get_representative_docs() and the topic browser for readable output.
+    lex_docs = passages_df["lex"].tolist()
+    str_docs = passages_df["str"].tolist()
+    topics, probs = topic_model.fit_transform(lex_docs)
 
-    # Pre-compute TF-IDF embeddings and pass them directly to fit_transform.
-    # This bypasses BERTopic's default sentence-transformer embedding step,
-    # which has no Hebrew/Aramaic model available.
-    _, tfidf_matrix, _ = build_tfidf_matrix(passages_df)
-    # Convert sparse matrix to dense numpy array for UMAP compatibility
-    embeddings = tfidf_matrix.toarray().astype(np.float32)
-
-    topics, probs = topic_model.fit_transform(docs, embeddings=embeddings)
-
-    n_found = len(set(topics))
+    n_found    = len(set(t for t in topics if t != -1))
     n_outliers = sum(1 for t in topics if t == -1)
-    print(f"BERTopic ({device_label}): {n_found} topics found, "
-          f"{n_outliers} outliers (topic -1)")
+    print(f"BERTopic ({device_label}): {n_found} topics after reduction, "
+          f"{n_outliers} outliers ({100*n_outliers/len(topics):.1f}%)")
+    print("To inspect topics with original text call: "
+          "topic_model.get_representative_docs() after updating docs with str_docs")
 
-    return topic_model, np.array(topics), np.array(probs) if probs is not None else np.zeros(len(topics))
+    return (
+        topic_model,
+        np.array(topics),
+        np.array(probs) if probs is not None else np.zeros(len(topics)),
+        str_docs,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -557,7 +585,11 @@ def run_pipeline_2(
     known_positives_df: pd.DataFrame,
     method: str = "lda",
     n_topics: int = 20,
+    n_range: range = range(10, 41, 5),
     evaluate_topic_range: bool = False,
+    min_df: int = 3,
+    max_df: float = 0.85,
+    ngram_range: tuple[int, int] = (1, 1),
     force_cpu: bool = False,
 ) -> pd.DataFrame:
     """
@@ -565,12 +597,29 @@ def run_pipeline_2(
 
     Parameters
     ----------
-    passages_df          : passage DataFrame (ref, str, morph, lex)
-    known_positives_df   : DataFrame with [ref_a, ref_b] (4,500 pairs)
+    passages_df          : passage DataFrame with columns: ref, str, morph, lex
+    known_positives_df   : DataFrame with columns: ref_a, ref_b
     method               : "lda" | "nmf" | "bertopic"
-    n_topics             : number of topics (tune with evaluate_topic_range=True)
-    evaluate_topic_range : print perplexity for n in 10..40 then exit (LDA/NMF)
-    force_cpu            : disable GPU even when available (BERTopic only)
+    n_topics             : number of topics for LDA/NMF; nr_topics reduction
+                           target for BERTopic (default 60 for BERTopic,
+                           20 for LDA/NMF — override as needed)
+    n_range              : range of topic counts to evaluate when
+                           evaluate_topic_range=True, e.g. range(10, 61, 5).
+                           Only used for LDA/NMF.
+    evaluate_topic_range : fit model for each n in n_range, print perplexity,
+                           then return without building pairs. LDA/NMF only.
+    min_df               : minimum document frequency for vectorizers.
+                           Lower = more vocabulary, more noise.
+                           Higher = cleaner features, smaller matrix.
+                           Not applied to BERTopic's internal c-TF-IDF
+                           vectorizer (always min_df=1 there).
+    max_df               : maximum document frequency fraction for vectorizers.
+                           Removes formulaic phrases shared across all topics.
+    ngram_range          : (1,1) unigrams only; (1,2) adds bigrams.
+                           Bigrams improve topic coherence for collocations
+                           but increase matrix size ~10x. Not used for
+                           BERTopic (sentence-transformer handles context).
+    force_cpu            : BERTopic only — disable GPU even when available.
 
     Returns
     -------
@@ -579,24 +628,28 @@ def run_pipeline_2(
     """
     Path("outputs").mkdir(exist_ok=True)
 
-    # Step 1: Build both matrices from the same vocabulary parameters.
-    # LDA requires raw counts; NMF/BERTopic/cosine sim use TF-IDF.
-    count_vec,  count_matrix,  count_features  = build_count_matrix(passages_df)
-    tfidf_vec,  tfidf_matrix,  tfidf_features  = build_tfidf_matrix(passages_df)
+    # Step 1: Build vectorized matrices.
+    # LDA requires raw counts; NMF/cosine sim use TF-IDF.
+    # BERTopic uses its own sentence-transformer embeddings — matrices are
+    # still built here for the cosine similarity baseline step.
+    count_vec,  count_matrix,  count_features  = build_count_matrix(
+        passages_df, min_df=min_df, max_df=max_df, ngram_range=ngram_range
+    )
+    tfidf_vec,  tfidf_matrix,  tfidf_features  = build_tfidf_matrix(
+        passages_df, min_df=min_df, max_df=max_df, ngram_range=ngram_range
+    )
 
-    # Step 2 (optional): tune topic count
+    # Step 2 (optional): tune topic count — LDA/NMF only
     if evaluate_topic_range and method in ("lda", "nmf"):
-        print("Evaluating topic range ...")
-        # LDA range evaluation uses count matrix; NMF uses tfidf
+        print(f"Evaluating topic range {list(n_range)} ...")
         eval_matrix = count_matrix if method == "lda" else tfidf_matrix
-        scores = evaluate_lda_range(eval_matrix)
+        scores = evaluate_lda_range(eval_matrix, n_range=n_range)
         scores.to_csv("outputs/lda_perplexity_scores.csv", index=False)
         print("Saved to outputs/lda_perplexity_scores.csv")
         return scores
 
-    # Step 3: Fit topic model with the methodologically correct matrix
+    # Step 3: Fit topic model
     if method == "lda":
-        # COUNT matrix -- respects LDA's multinomial generative assumption
         model, topic_assignments, topic_dists = fit_lda(count_matrix, n_topics)
         print("\nTop lemmas per topic:")
         print_lda_topics(model, count_features)
@@ -605,8 +658,6 @@ def run_pipeline_2(
         device = "cpu"
 
     elif method == "nmf":
-        # TF-IDF matrix -- NMF's non-negativity constraint is compatible with
-        # TF-IDF floats; IDF downweighting improves coherence on formulaic text
         model, topic_assignments, topic_dists = fit_nmf(tfidf_matrix, n_topics)
         print("\nTop lemmas per topic (NMF):")
         print_lda_topics(model, tfidf_features)
@@ -615,10 +666,16 @@ def run_pipeline_2(
         device = "cpu"
 
     elif method == "bertopic":
-        # TF-IDF representations fed into UMAP dimensionality reduction
-        model, topic_assignments, topic_dists = fit_bertopic(
-            passages_df, n_topics, force_cpu=force_cpu
+        # BERTopic uses its own multilingual sentence-transformer for embeddings.
+        # n_topics here is the nr_topics reduction target (default 60).
+        # min_df/max_df/ngram_range are not passed — sentence-transformer
+        # handles tokenization; only the cosine sim baseline uses the matrices.
+        model, topic_assignments, topic_dists, bertopic_str_docs = fit_bertopic(
+            passages_df, n_topics=n_topics, force_cpu=force_cpu
         )
+        # Store original-text docs on the model for use in evaluation /
+        # topic browser. Callers access via: topic_model.get_document_info(str_docs)
+        model._str_docs = bertopic_str_docs
         primary_vectorizer = tfidf_vec
         primary_features   = tfidf_features
         device = "gpu" if (CUML_AVAILABLE and not force_cpu) else "cpu"
@@ -634,7 +691,7 @@ def run_pipeline_2(
     # Step 5: Build positive pairs from known Levenshtein matches
     pairs_df = build_pairs(passages_df, known_positives_df)
 
-    # Step 6: Baseline cosine similarity -- always uses TF-IDF matrix
+    # Step 6: Baseline cosine similarity — always uses TF-IDF matrix
     pairs_df = compute_pair_similarities(
         pairs_df, passages_df, tfidf_vec, tfidf_matrix
     )
@@ -656,19 +713,22 @@ def run_pipeline_2(
     print(f"\nSaved {len(labeled_pairs)} pairs → {out_path}")
     print(labeled_pairs["label"].value_counts().to_string())
 
-    # Save model + both vectorizers
+    # Save model + vectorizers
     import pickle
     model_path = f"outputs/pipeline2_{method}_model.pkl"
     with open(model_path, "wb") as f:
         pickle.dump({
             "model":              model,
-            "primary_vectorizer": primary_vectorizer,   # count (LDA) or tfidf (NMF/BERTopic)
+            "primary_vectorizer": primary_vectorizer,
             "primary_features":   primary_features,
-            "tfidf_vectorizer":   tfidf_vec,            # always saved; used for cosine sim
+            "tfidf_vectorizer":   tfidf_vec,
             "tfidf_features":     tfidf_features,
             "device":             device,
             "n_topics":           n_topics,
             "method":             method,
+            "min_df":             min_df,
+            "max_df":             max_df,
+            "ngram_range":        ngram_range,
         }, f)
     print(f"Model saved → {model_path}")
 
