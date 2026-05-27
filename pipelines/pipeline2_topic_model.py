@@ -484,11 +484,13 @@ def fit_bertopic(
         stop_words=None,  # Dicta lemmas already normalized; keep all
     )
 
+    #problem here
     topic_model = BERTopic(
         umap_model=umap_model,
         hdbscan_model=hdbscan_model,
         vectorizer_model=vectorizer_model,
         nr_topics=n_topics,
+        language="multilingual"
         calculate_probabilities=not use_gpu,  # cuML HDBSCAN: no soft probs
         verbose=True,
     )
