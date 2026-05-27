@@ -436,8 +436,21 @@ def fit_bertopic(
     force_cpu: bool = False,
 ) -> tuple:
     """
-    BERTopic over lemmatized texts, using TF-IDF as the embedding step.
-    Avoids the Hebrew/Aramaic neural embedding problem — no language model used.
+    BERTopic over lemmatized texts, using TF-IDF matrix as embeddings.
+
+    Why we pass embeddings explicitly:
+      BERTopic's default pipeline runs a sentence-transformer to produce
+      embeddings, then feeds them into UMAP. For Hebrew/Aramaic there is no
+      suitable sentence-transformer, so we skip that step entirely by
+      pre-computing a TF-IDF matrix and passing it directly as `embeddings`
+      to fit_transform(). BERTopic then goes straight to UMAP → HDBSCAN
+      → topic representation, bypassing the neural embedding step.
+
+      The internal CountVectorizer (vectorizer_model) is used only for the
+      final topic-word representation step (c-TF-IDF), not for embeddings.
+      It must use token_pattern=r"[^\s]+" to handle Hebrew/Aramaic tokens;
+      the default r"(?u)\b\w\w+\b" pattern matches only ASCII word characters
+      and produces an empty vocabulary on Hebrew text.
 
     GPU path (when CUDA + cuML available):
       UMAP and HDBSCAN run on GPU via cuML — typically 5-20x faster than CPU
@@ -463,9 +476,11 @@ def fit_bertopic(
     umap_model    = _build_umap(seed, use_gpu)
     hdbscan_model = _build_hdbscan(use_gpu)
 
+    # This vectorizer is used only for c-TF-IDF topic-word representations,
+    # NOT for producing embeddings. token_pattern must handle Hebrew tokens.
     vectorizer_model = CountVectorizer(
         token_pattern=r"[^\s]+",
-        min_df=3,
+        min_df=2,         # lowered from 3: small corpus, avoid empty vocab
         stop_words=None,  # Dicta lemmas already normalized; keep all
     )
 
@@ -479,7 +494,15 @@ def fit_bertopic(
     )
 
     docs = passages_df["lex"].tolist()
-    topics, probs = topic_model.fit_transform(docs)
+
+    # Pre-compute TF-IDF embeddings and pass them directly to fit_transform.
+    # This bypasses BERTopic's default sentence-transformer embedding step,
+    # which has no Hebrew/Aramaic model available.
+    _, tfidf_matrix, _ = build_tfidf_matrix(passages_df)
+    # Convert sparse matrix to dense numpy array for UMAP compatibility
+    embeddings = tfidf_matrix.toarray().astype(np.float32)
+
+    topics, probs = topic_model.fit_transform(docs, embeddings=embeddings)
 
     n_found = len(set(topics))
     n_outliers = sum(1 for t in topics if t == -1)
