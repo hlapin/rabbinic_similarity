@@ -591,6 +591,7 @@ def run_pipeline_2(
     max_df: float = 0.85,
     ngram_range: tuple[int, int] = (1, 1),
     force_cpu: bool = False,
+    matrix_cache: dict | None = None,
 ) -> pd.DataFrame:
     """
     Full Pipeline 2 entrypoint.
@@ -620,6 +621,17 @@ def run_pipeline_2(
                            but increase matrix size ~10x. Not used for
                            BERTopic (sentence-transformer handles context).
     force_cpu            : BERTopic only — disable GPU even when available.
+    matrix_cache         : optional dict with pre-built matrices to skip
+                           building from scratch. Useful when running multiple
+                           methods with the same vocabulary parameters.
+                           Expected keys: "count" and/or "tfidf", each mapping
+                           to a (vectorizer, matrix, feature_names) tuple.
+                           Example:
+                               cache = {}
+                               cache["tfidf"] = build_tfidf_matrix(passages_df, ...)
+                               cache["count"] = build_count_matrix(passages_df, ...)
+                               p2_lda = run_pipeline_2(..., matrix_cache=cache)
+                               p2_nmf = run_pipeline_2(..., matrix_cache=cache)
 
     Returns
     -------
@@ -628,16 +640,88 @@ def run_pipeline_2(
     """
     Path("outputs").mkdir(exist_ok=True)
 
-    # Step 1: Build vectorized matrices.
-    # LDA requires raw counts; NMF/cosine sim use TF-IDF.
-    # BERTopic uses its own sentence-transformer embeddings — matrices are
-    # still built here for the cosine similarity baseline step.
-    count_vec,  count_matrix,  count_features  = build_count_matrix(
-        passages_df, min_df=min_df, max_df=max_df, ngram_range=ngram_range
-    )
-    tfidf_vec,  tfidf_matrix,  tfidf_features  = build_tfidf_matrix(
-        passages_df, min_df=min_df, max_df=max_df, ngram_range=ngram_range
-    )
+    # Step 1: Build vectorized matrices — lazily and conditionally.
+    #
+    # Load order for each matrix:
+    #   1. Already in memory (caller passed via matrix_cache dict)
+    #   2. Saved pkl in outputs/ from a previous run
+    #   3. Build from scratch
+    #
+    # Only the matrices required by the chosen method are loaded/built:
+    #   LDA     : count matrix (fit) + tfidf matrix (cosine sim baseline)
+    #   NMF     : tfidf matrix only
+    #   BERTopic: tfidf matrix only (cosine sim baseline; embeddings are
+    #             computed internally by the sentence-transformer)
+    #
+    # Cache key convention: outputs/matrix_{type}_mdf{min_df}_xdf{max_df}
+    #                        _ng{ngram_range[0]}{ngram_range[1]}.pkl
+    # where type is "count" or "tfidf".
+
+    import pickle as _pickle
+
+    def _matrix_cache_path(mtype: str) -> Path:
+        ng = f"{ngram_range[0]}{ngram_range[1]}"
+        return Path(
+            f"outputs/matrix_{mtype}"
+            f"_mdf{min_df}_xdf{max_df}_ng{ng}.pkl"
+        )
+
+    def _load_or_build_matrix(mtype: str, build_fn):
+        """
+        Load matrix from memory cache, disk pkl, or build from scratch.
+        Returns (vectorizer, matrix, feature_names).
+        """
+        # 1. Caller-supplied in-memory cache
+        if matrix_cache and mtype in matrix_cache:
+            print(f"  {mtype} matrix: loaded from memory cache")
+            return matrix_cache[mtype]
+
+        # 2. Disk cache
+        cache_path = _matrix_cache_path(mtype)
+        if cache_path.exists():
+            print(f"  {mtype} matrix: loading from {cache_path} ...", end="", flush=True)
+            try:
+                with open(cache_path, "rb") as f:
+                    result = _pickle.load(f)
+                print(" done")
+                return result
+            except Exception as e:
+                print(f" failed ({e}) — rebuilding")
+
+        # 3. Build from scratch and save
+        print(f"  {mtype} matrix: building from scratch ...")
+        result = build_fn()
+        try:
+            with open(cache_path, "wb") as f:
+                _pickle.dump(result, f)
+            print(f"  {mtype} matrix: saved to {cache_path}")
+        except Exception as e:
+            print(f"  {mtype} matrix: could not save cache ({e})")
+        return result
+
+    # Build only what the method needs
+    needs_count = method == "lda"
+    needs_tfidf = method in ("lda", "nmf", "bertopic")
+
+    if needs_count:
+        count_vec, count_matrix, count_features = _load_or_build_matrix(
+            "count",
+            lambda: build_count_matrix(
+                passages_df, min_df=min_df, max_df=max_df, ngram_range=ngram_range
+            ),
+        )
+    else:
+        count_vec = count_matrix = count_features = None
+
+    if needs_tfidf:
+        tfidf_vec, tfidf_matrix, tfidf_features = _load_or_build_matrix(
+            "tfidf",
+            lambda: build_tfidf_matrix(
+                passages_df, min_df=min_df, max_df=max_df, ngram_range=ngram_range
+            ),
+        )
+    else:
+        tfidf_vec = tfidf_matrix = tfidf_features = None
 
     # Step 2 (optional): tune topic count — LDA/NMF only
     if evaluate_topic_range and method in ("lda", "nmf"):
